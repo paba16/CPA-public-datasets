@@ -1,0 +1,10 @@
+.venv
+.vscode
+AES-HD-Dataset
+ASCAD_databases
+randomdelays
+corrs
+
+.DS_Store
+*.h5
+*.npy
