@@ -29,78 +29,86 @@ s_box = [
     0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
 ]
-s_box_np = torch.tensor(s_box)
+s_box_tensor = torch.tensor(s_box)
 
 def correlate_traces(plaintexts: torch.tensor,
                      traces_centered: torch.tensor,
                      traces_std: torch.tensor):
     """
-    Performs correlation power attack
+    Executes correlation power attack by getting hamming weights of sbox output
+    for  each key hypothesis, and computing the correlation between the hamming
+    weights and traces for each key hypothesis and each trace.
 
-    :plaintexts: array of the same byte of plaintext
-    :traces_centered: precomputed traces - traces.mean(axis=0)
-    :traces_std: precomputed traces.std(axis=0)
+    Correlation is computed as Pearson's r, based on formula:
+    correlation = E[(iv - mean(iv)) (trace - mean(trace))]
+                  / ( std(iv) * std(trace))
 
-    :returns:
+    Using vectorized computation, this is performed as
+    correlation = dot_product((iv - mean(iv), (trace - mean(trace))
+                  / ( len(iv) * std(iv) * std(trace))
+
+    Performance increase is gained by using precomputed traces_centered as well
+    as traces_std. 
+
+    :plaintexts: array of the i-th byte of plaintext, with any i, shaped (i, 1)
+    :traces_centered: precomputed traces - traces.mean(axis=0), shaped (i, j)
+    :traces_std: precomputed traces.std(axis=0) shaped (j,)
+
+    :returns: array of correlations shaped (256, j)
     """
-    # get hamming weight of each key hypothesis
-    # in the end we'll have array of shape (256, plaintexts.shape[0])
-    # an array of intermediate values of each plaintext for each key hypothesis
-    N = plaintexts.shape[0]
-    y = torch.zeros((256, plaintexts.shape[0]), dtype=ftype)
+    I = plaintexts.shape[0]
+    iv = torch.zeros((256, I), dtype=ftype)
+    # unoptimized, but not a bottleneck
     for key in range(256):
         xor = key ^ plaintexts
-        switch = s_box_np[xor]
+        switch = torch.index_select(s_box_tensor, 0, xor)
 
-        # hamming weight method
         weights = np.bitwise_count(switch)
 
-        y[key] = switch
+        iv[key] = weights
 
-    y_centered = y - y.mean(dim=1, keepdim=True)
-    y_std = y.std(dim=1, keepdim=True)
+    iv_centered = iv - iv.mean(dim=1, keepdim=True)
+    iv_std = iv.std(dim=1, keepdim=True)
 
-    dot = torch.matmul(y_centered, traces_centered)  # shape: (256, T)
-    denom = y_std * traces_std * N
+    dot = torch.matmul(iv_centered, traces_centered)
+    denom = iv_std * traces_std * I
     return dot / denom
 
-def spliced_traces(file_path):
+
+def spliced_traces(file_path, epochs, start_epoch=0, processes=8):
     """
     Executes a CPA attack on all 16 key bytes by batching traces to stay within
-    memory limits.
+    memory limits. Due to this limitation we delete large variables whenever
+    possible.
     
     Optimizes attack by pre computing centered traces, that are later stored
     in shared memory, as well as standard deviation for traces.
 
     :file_path: Path an H5 file containing "traces" and "metadata/plaintext"
+    :epochs: amount of parts to split traces into, due to memory limitations
+    :start_epochs: initial epoch
+    :processes: amount of processes to split computations into
     """
+
     with h5py.File(file_path) as f:
-        traces = f["traces"]
-        metadata = f["metadata"]
-        plaintexts = metadata["plaintext"]
-        plaintexts = torch.tensor(plaintexts, dtype=torch.bool)
+        plaintexts = f["metadata"]["plaintext"]
+        plaintexts = torch.tensor(plaintexts, dtype=torch.int32)
         plaintexts.share_memory_()
 
-        start = 3
-        epochs = 5
-        step = traces.shape[1] // epochs
+        traces_shape = f["traces"].shape
+        step = traces_shape[1] // epochs
+        
+        traces = f["traces"][:, step * start_epoch: step * (start_epoch + 1)]
+        traces = torch.tensor(traces, dtype=ftype)
+        traces_centered = traces - traces.mean(dim=0)
+        traces_centered.share_memory_()
+        traces_std = traces.std(dim=0)
+        del traces
 
-        traces = torch.tensor(traces[:, step * start: step * (start + 1)]
-                              , dtype=ftype)
-
-    traces_centered = traces - traces.mean(dim=0, dtype=ftype)
-    traces_centered.share_memory_()
-    traces_std = traces.std(dim=0)
-
-    # traces_shm, traces_info, traces_array = setup_shm(traces_centered)
-    # deletes unpickle-able h5py variables, as well as trace_diff from shm
-    del f, metadata, traces
-
-    processes = 8
     start_time = time.time()
     with mp.Pool(processes=processes) as pool:
-        for i in range(start, epochs):
-            ending = i == epochs - 1
+        i = start_epoch
+        while i < epochs:
 
             results = pool.starmap_async(
                 correlate_traces,
@@ -109,21 +117,20 @@ def spliced_traces(file_path):
                     for j in range(16)
                 ]
             )
-            
-            if not ending:
+            i += 1
+            if i < epochs:
                 # prepare another batch of traces
                 with h5py.File(file_path) as f:
-                    f = h5py.File(file_path)
-                    traces = torch.tensor(f["traces"][:, step * i: step * (i + 1)],
-                                        dtype=ftype)
-                    traces_std = traces.std(dim=0)
+                    traces = f["traces"][:, step * i: step * (i + 1)]
+                    traces = torch.tensor(traces, dtype=ftype)
                     traces_mean = traces.mean(dim=0)
+                    traces_std = traces.std(dim=0)
 
             results = results.get()
-            np.save(f"corrs/{file_path.split('/')[-1]}-{i}", results)
+            np.save(f"corrs/64{file_path.split('/')[-1]}-{i-1}", results)
             del results
 
-            if not ending:
+            if i < epochs:
                 traces_centered = traces - traces_mean
                 del traces, traces_mean
 
@@ -131,4 +138,4 @@ def spliced_traces(file_path):
 
 
 if __name__ == "__main__":
-    spliced_traces("ASCAD_databases/ATMega8515_raw_traces.h5")
+    spliced_traces("ASCAD_databases/ATMega8515_raw_traces.h5", 8, 0)
