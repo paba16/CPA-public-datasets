@@ -1,11 +1,13 @@
 import h5py
 import numpy as np
-import multiprocessing
+# import multiprocessing as mp
+import torch.multiprocessing as mp
+import torch
 
 import logging
 import time
 
-ftype = np.float32
+ftype = torch.float32
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -27,28 +29,11 @@ s_box = [
     0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
 ]
-s_box_np = np.array(s_box)
+s_box_np = torch.tensor(s_box)
 
-class SharedMemoryItem:
-    def __init__(self, name, shape, dtype):
-        self.name = name
-        self.shape = shape
-        self.dtype = dtype
-
-
-def worker_correlate_traces(traces_info: SharedMemoryItem, traces_std, pt: np.ndarray):
-    traces_shm = multiprocessing.shared_memory.SharedMemory(name=traces_info.name)
-    traces_centered = np.ndarray(shape=traces_info.shape, 
-                                 dtype=traces_info.dtype, 
-                                 buffer=traces_shm.buf)
-    
-    start = time.perf_counter()
-    result = correlate_traces(pt, traces_centered, traces_std)
-    logger.info(f"thread finished in {time.perf_counter() - start} s")
-    
-    return result
-
-def correlate_traces(plaintexts: np.array, traces_centered, traces_std):
+def correlate_traces(plaintexts: torch.tensor,
+                     traces_centered: torch.tensor,
+                     traces_std: torch.tensor):
     """
     Performs correlation power attack
 
@@ -61,7 +46,8 @@ def correlate_traces(plaintexts: np.array, traces_centered, traces_std):
     # get hamming weight of each key hypothesis
     # in the end we'll have array of shape (256, plaintexts.shape[0])
     # an array of intermediate values of each plaintext for each key hypothesis
-    intermediate_value = []
+    N = plaintexts.shape[0]
+    y = torch.zeros((256, plaintexts.shape[0]), dtype=ftype)
     for key in range(256):
         xor = key ^ plaintexts
         switch = s_box_np[xor]
@@ -69,41 +55,14 @@ def correlate_traces(plaintexts: np.array, traces_centered, traces_std):
         # hamming weight method
         weights = np.bitwise_count(switch)
 
-        intermediate_value.append(weights)
+        y[key] = switch
 
-    y = np.array(intermediate_value)
-    y_centered = y - y.mean(axis=1, keepdims=True)
-    y_centered = y_centered.astype(ftype)
-    y_std = y.std(axis=1, keepdims=True, dtype=ftype)
+    y_centered = y - y.mean(dim=1, keepdim=True)
+    y_std = y.std(dim=1, keepdim=True)
 
-    # result = np.einsum('ki,ij->kj', y_diff, traces_diff) / (y_std * traces_std * len(y))
-    
-    ## optional for keeping track of progress, performance is about the same
-    start = time.process_time()
-    result = [None for key in range(256)]
-    for key in range(256):
-        logger.info(f"{key/256:.2%} {time.process_time() - start:.2f}")
-        start = time.process_time()
-        # performs a pearson's r correlation using formula
-        # (Y - mean(Y)) * (traces - mean(traces)) / (N * std(Y) * std(traces))
-        # - np.einsum('i,ij->j') performs a dot product between arrays of shape (i,) and (i, j)
-        # - np.einsum has better performance than np.dot
-        result[key] = np.einsum('i,ij->j', y_centered[key], traces_centered) / (y_std[key] * traces_std * len(y))
-
-    return result
-
-
-def setup_shm(array: np.ndarray):
-    shm = multiprocessing.shared_memory.SharedMemory(create=True, size=array.nbytes)
-
-    array_info = SharedMemoryItem(
-        name=shm.name, shape=array.shape, dtype=array.dtype
-    )
-
-    shared_array = np.ndarray(array_info.shape, array_info.dtype, buffer=shm.buf)
-    np.copyto(shared_array, array)
-    return shm, array_info, shared_array
-
+    dot = torch.matmul(y_centered, traces_centered)  # shape: (256, T)
+    denom = y_std * traces_std * N
+    return dot / denom
 
 def spliced_traces(file_path):
     """
@@ -119,54 +78,56 @@ def spliced_traces(file_path):
         traces = f["traces"]
         metadata = f["metadata"]
         plaintexts = metadata["plaintext"]
-        plaintexts = np.array(plaintexts)
+        plaintexts = torch.tensor(plaintexts, dtype=torch.bool)
+        plaintexts.share_memory_()
 
-    start = 0
-    epochs = 1
-    step = traces.shape[1] // epochs
+        start = 3
+        epochs = 5
+        step = traces.shape[1] // epochs
 
-    traces = traces[:, step * start: step * (start + 1)]
-    traces = np.array(traces)
+        traces = torch.tensor(traces[:, step * start: step * (start + 1)]
+                              , dtype=ftype)
 
-    traces_diff = traces - traces.mean(axis=0, dtype=ftype)
-    traces_std = traces.std(axis=0, dtype=ftype)
+    traces_centered = traces - traces.mean(dim=0, dtype=ftype)
+    traces_centered.share_memory_()
+    traces_std = traces.std(dim=0)
 
-    traces_shm, traces_info, traces_array = setup_shm(traces_diff)
+    # traces_shm, traces_info, traces_array = setup_shm(traces_centered)
     # deletes unpickle-able h5py variables, as well as trace_diff from shm
-    del f, metadata, traces, traces_diff
+    del f, metadata, traces
 
+    processes = 8
     start_time = time.time()
-    for i in range(start, epochs):
-        processes = 8
+    with mp.Pool(processes=processes) as pool:
+        for i in range(start, epochs):
+            ending = i == epochs - 1
 
-        if i != start:
-            # prepare another batch of traces
-            with h5py.File(file_path) as f:
-                f = h5py.File(file_path)
-                traces = f["traces"][:, step * i: step * (i + 1)]
-                traces = np.array(traces)
-
-            traces_diff = traces - traces.mean(axis=0)
-            traces_std = traces.std(axis=0)
-
-            np.copyto(traces_array, traces_diff)
-            del f, traces, traces_diff
-
-        with multiprocessing.Pool(processes=processes) as pool:
-            results = pool.starmap(
-                worker_correlate_traces,
+            results = pool.starmap_async(
+                correlate_traces,
                 [
-                    (traces_info, traces_std, plaintexts[:, j])
+                    (plaintexts[:, j], traces_centered, traces_std)
                     for j in range(16)
                 ]
             )
+            
+            if not ending:
+                # prepare another batch of traces
+                with h5py.File(file_path) as f:
+                    f = h5py.File(file_path)
+                    traces = torch.tensor(f["traces"][:, step * i: step * (i + 1)],
+                                        dtype=ftype)
+                    traces_std = traces.std(dim=0)
+                    traces_mean = traces.mean(dim=0)
+
+            results = results.get()
             np.save(f"corrs/{file_path.split('/')[-1]}-{i}", results)
             del results
 
-        logger.info(f"done {time.time() - start_time:.2f}")
+            if not ending:
+                traces_centered = traces - traces_mean
+                del traces, traces_mean
 
-    traces_shm.close()
-    traces_shm.unlink()
+            logger.info(f"done {time.time() - start_time:.2f}")
 
 
 if __name__ == "__main__":
