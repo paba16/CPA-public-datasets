@@ -30,14 +30,14 @@ s_box = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
 ]
 s_box_tensor = torch.tensor(s_box)
+hamming_weight = torch.tensor([np.bitwise_count(i) for i in range(256)], dtype=ftype)
 
-def correlate_traces(plaintexts: torch.tensor,
+def correlate_traces(plaintext: torch.tensor,
                      traces_centered: torch.tensor,
                      traces_std: torch.tensor):
     """
-    Executes correlation power attack by getting hamming weights of sbox output
-    for  each key hypothesis, and computing the correlation between the hamming
-    weights and traces for each key hypothesis and each trace.
+    Computes Pearson's R correlation between hamming weights of sbox output for
+    each key hypothesis, and traces for each of 256 key hypotheses.
 
     Correlation is computed as Pearson's r, based on formula:
     correlation = E[(iv - mean(iv)) (trace - mean(trace))]
@@ -50,29 +50,34 @@ def correlate_traces(plaintexts: torch.tensor,
     Performance increase is gained by using precomputed traces_centered as well
     as traces_std. 
 
-    :plaintexts: array of the i-th byte of plaintext, with any i, shaped (i, 1)
+    Assumes
+    - i = amount of traces
+    - j = amount of samples per trace
+    :plaintexts: tensor of the specific byte of plaintext, shaped (i, 1)
     :traces_centered: precomputed traces - traces.mean(axis=0), shaped (i, j)
     :traces_std: precomputed traces.std(axis=0) shaped (j,)
 
     :returns: array of correlations shaped (256, j)
     """
-    I = plaintexts.shape[0]
+    I = plaintext.shape[0]
     iv = torch.zeros((256, I), dtype=ftype)
-    # unoptimized, but not a bottleneck
-    for key in range(256):
-        xor = key ^ plaintexts
+    for key_hypothesis in range(256):
+        # Sbox(key_hypothesis ^ plaintext)
+        xor = key_hypothesis ^ plaintext
         switch = torch.index_select(s_box_tensor, 0, xor)
-
-        weights = np.bitwise_count(switch)
-
-        iv[key] = weights
+        
+        # hamming weight of sbox output
+        weights = torch.index_select(hamming_weight, 0, switch)
+        iv[key_hypothesis] = weights
 
     iv_centered = iv - iv.mean(dim=1, keepdim=True)
     iv_std = iv.std(dim=1, keepdim=True)
 
-    dot = torch.matmul(iv_centered, traces_centered)
+    # (iv - iv.mean()) * (traces - traces.mean(dim=0))
+    nom = torch.matmul(iv_centered, traces_centered)
+    # iv.std() * traces.std() * amount of traces I
     denom = iv_std * traces_std * I
-    return dot / denom
+    return nom / denom
 
 
 def spliced_traces(file_path, epochs, start_epoch=0, processes=8):
@@ -127,7 +132,7 @@ def spliced_traces(file_path, epochs, start_epoch=0, processes=8):
                     traces_std = traces.std(dim=0)
 
             results = results.get()
-            np.save(f"corrs/64{file_path.split('/')[-1]}-{i-1}", results)
+            np.save(f"corrs/{file_path.split('/')[-1]}-{i-1}", results)
             del results
 
             if i < epochs:
@@ -138,4 +143,9 @@ def spliced_traces(file_path, epochs, start_epoch=0, processes=8):
 
 
 if __name__ == "__main__":
-    spliced_traces("ASCAD_databases/ATMega8515_raw_traces.h5", 8, 0)
+    # on macos having only 1 additional process has great performance
+    # as torch.mp can fully utilize multiple cpu cores, while main process
+    # loads another batch.
+    # there may still be some performance gain by multiprocessing preprocessing
+    # however, we are mostly limited by memory
+    spliced_traces("ASCAD_databases/ATMega8515_raw_traces.h5", 5, 3, 1)
